@@ -1,0 +1,28 @@
+# Build artifacts
+build_temp/
+Assemble/
+__pycache__/
+*.pyc
+*.pyo
+*.exe
+*.spec
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Skills/agent folders
+antigravity-awesome-skills/
+.agents/
+.agent/
+_agents/
+_agent/
+.gemini/
+
+# Temp
+*.tmp
+*.log
