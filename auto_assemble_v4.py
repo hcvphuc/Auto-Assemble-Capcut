@@ -207,7 +207,9 @@ def match_scenes(
 
     # Bound: max words the cursor can advance per scene
     avg_words_per_scene = max(1, len(srt_all_words) // max(1, len(scenes)))
-    max_advance_per_scene = avg_words_per_scene * 4  # generous window
+    # Use generous window: 8x average with minimum floor of 200 words
+    # This prevents cascading misalignment when scene lengths vary wildly
+    max_advance_per_scene = max(200, avg_words_per_scene * 8)
 
     for scene in scenes:
         s_words = normalize_words(scene.text)
