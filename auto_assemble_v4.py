@@ -1372,9 +1372,12 @@ def gemini_correct_srt(srt_content: str, script_text: str, api_key: str,
 
 
 def align_srt_with_script(srt_content: str, script_text: str) -> str:
-    """Post-process SRT by aligning words with the original script.
-    Keeps SRT timestamps intact but replaces mismatched words with script words.
-    Uses difflib.SequenceMatcher for robust word alignment.
+    """Fix spelling in SRT using the original script as reference.
+    
+    Safe approach: builds a word-correction dictionary from the script,
+    then applies corrections to each SRT entry INDEPENDENTLY.
+    Never changes word count, never shifts words between entries.
+    Timestamps are guaranteed to stay perfectly aligned.
     """
     import difflib
 
@@ -1392,46 +1395,60 @@ def align_srt_with_script(srt_content: str, script_text: str) -> str:
     if not entries:
         return srt_content
 
-    # Normalize for comparison
-    def normalize(s):
-        return re.sub(r'[^a-zA-Z0-9\s]', '', s.lower()).split()
+    # Normalize helper
+    def norm(w):
+        return re.sub(r'[^a-zA-Z0-9]', '', w.lower())
 
-    # Get all words from SRT and script
-    srt_all_text = ' '.join(e['text'] for e in entries)
-    srt_words = srt_all_text.split()
-    srt_words_norm = normalize(srt_all_text)
-
+    # Step 1: Build spelling dictionary from script
+    # Map normalized_word -> original_spelling (preserving capitalization)
     script_words = script_text.split()
-    script_words_norm = normalize(script_text)
+    script_dict = {}  # norm -> best script spelling
+    for w in script_words:
+        nw = norm(w)
+        if nw and len(nw) >= 2:
+            # Keep the first occurrence (usually the "canonical" spelling)
+            if nw not in script_dict:
+                # Strip trailing punctuation for cleaner replacement
+                clean = re.sub(r'[.,;:!?"\')]+$', '', w)
+                clean = re.sub(r'^[("\'"]+', '', clean)
+                if clean:
+                    script_dict[nw] = clean
 
-    # Align using SequenceMatcher
-    matcher = difflib.SequenceMatcher(None, srt_words_norm, script_words_norm)
-    replacements = {}  # srt_word_index -> script_word
-
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == 'equal':
-            # Words match — use script version (preserves original capitalization)
-            for k, (si, sj) in enumerate(zip(range(i1, i2), range(j1, j2))):
-                replacements[si] = script_words[sj]
-        elif tag == 'replace':
-            # Words differ — use script version
-            srt_span = list(range(i1, i2))
-            scr_span = list(range(j1, j2))
-            for k in range(min(len(srt_span), len(scr_span))):
-                replacements[srt_span[k]] = script_words[scr_span[k]]
-
-    # Apply replacements
-    corrected_words = []
-    for i, w in enumerate(srt_words):
-        corrected_words.append(replacements.get(i, w))
-
-    # Rebuild SRT entries with corrected words
-    word_idx = 0
+    # Step 2: Correct each entry independently
     result_lines = []
     for entry in entries:
-        orig_word_count = len(entry['text'].split())
-        new_text = ' '.join(corrected_words[word_idx:word_idx + orig_word_count])
-        word_idx += orig_word_count
+        words = entry['text'].split()
+        corrected = []
+        for w in words:
+            nw = norm(w)
+            if nw in script_dict:
+                script_spelling = script_dict[nw]
+                # Only replace if the word differs in its alphabetic content
+                # (preserves punctuation attached to the SRT word)
+                srt_alpha = norm(w)
+                scr_alpha = norm(script_spelling)
+                if srt_alpha == scr_alpha and w != script_spelling:
+                    # Same word, different capitalization → use script version
+                    # Preserve any trailing punctuation from SRT
+                    trailing = re.search(r'[.,;:!?]+$', w)
+                    replacement = script_spelling + (trailing.group() if trailing else '')
+                    corrected.append(replacement)
+                else:
+                    corrected.append(w)
+            elif nw and len(nw) >= 3:
+                # Try fuzzy match for close misspellings (e.g., "Jhon" → "John")
+                close = difflib.get_close_matches(nw, script_dict.keys(), n=1, cutoff=0.85)
+                if close:
+                    script_spelling = script_dict[close[0]]
+                    trailing = re.search(r'[.,;:!?]+$', w)
+                    replacement = script_spelling + (trailing.group() if trailing else '')
+                    corrected.append(replacement)
+                else:
+                    corrected.append(w)
+            else:
+                corrected.append(w)
+
+        new_text = ' '.join(corrected)
         result_lines.append(f"{entry['idx']}\n{entry['timing']}\n{new_text}\n")
 
     return '\n'.join(result_lines)
