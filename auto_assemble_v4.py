@@ -1250,7 +1250,124 @@ def segments_to_srt(segments: list) -> str:
         end   = _secs_to_srt_time(seg['end'])
         text  = seg['text'].strip()
         lines.append(f"{i}\n{start} --> {end}\n{text}\n")
-    return "\n".join(lines)
+    raw_srt = "\n".join(lines)
+    # Post-process: split overly long entries
+    return split_long_srt_entries(raw_srt)
+
+
+def _srt_time_to_ms(ts: str) -> int:
+    """Parse SRT timestamp like '00:16:14,769' to milliseconds."""
+    h, m, rest = ts.split(':')
+    s, ms = rest.split(',')
+    return int(h) * 3600000 + int(m) * 60000 + int(s) * 1000 + int(ms)
+
+def _ms_to_srt_time(ms: int) -> str:
+    """Convert milliseconds to SRT timestamp."""
+    h = ms // 3600000; ms %= 3600000
+    m = ms // 60000;   ms %= 60000
+    s = ms // 1000;    ms %= 1000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+MAX_ENTRY_DURATION_MS = 8000  # 8 seconds
+MAX_ENTRY_WORDS = 15
+
+def split_long_srt_entries(srt_content: str) -> str:
+    """Split SRT entries that are too long (>8s or >15 words) into smaller ones.
+    Splits at sentence boundaries when possible, otherwise splits evenly.
+    Timestamps are interpolated proportionally by word count.
+    """
+    blocks = re.split(r'\n\n+', srt_content.strip())
+    new_entries = []
+
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) < 3 or '-->' not in lines[1]:
+            continue
+
+        timing = lines[1].strip()
+        text = ' '.join(lines[2:]).strip()
+        words = text.split()
+
+        # Parse timestamps
+        parts = timing.split(' --> ')
+        start_ms = _srt_time_to_ms(parts[0].strip())
+        end_ms = _srt_time_to_ms(parts[1].strip())
+        duration_ms = end_ms - start_ms
+
+        # Check if entry needs splitting
+        if duration_ms <= MAX_ENTRY_DURATION_MS and len(words) <= MAX_ENTRY_WORDS:
+            new_entries.append({'start': start_ms, 'end': end_ms, 'text': text})
+            continue
+
+        # Split text into chunks at sentence boundaries
+        chunks = _split_text_smart(text)
+
+        # Distribute time proportionally by word count
+        total_words = sum(len(c.split()) for c in chunks)
+        if total_words == 0:
+            new_entries.append({'start': start_ms, 'end': end_ms, 'text': text})
+            continue
+
+        cursor_ms = start_ms
+        for chunk in chunks:
+            chunk_words = len(chunk.split())
+            chunk_duration = int(duration_ms * chunk_words / total_words)
+            chunk_end = min(cursor_ms + chunk_duration, end_ms)
+            new_entries.append({
+                'start': cursor_ms,
+                'end': chunk_end,
+                'text': chunk.strip()
+            })
+            cursor_ms = chunk_end
+
+    # Rebuild SRT
+    result = []
+    for i, entry in enumerate(new_entries, 1):
+        start_ts = _ms_to_srt_time(entry['start'])
+        end_ts = _ms_to_srt_time(entry['end'])
+        result.append(f"{i}\n{start_ts} --> {end_ts}\n{entry['text']}\n")
+
+    return '\n'.join(result)
+
+
+def _split_text_smart(text: str, max_words: int = 12) -> list:
+    """Split text into chunks, preferring sentence boundaries.
+    Falls back to splitting by word count if no punctuation found.
+    """
+    # First try splitting at sentence boundaries (. ! ?)
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    chunks = []
+    current = []
+    current_words = 0
+
+    for sentence in sentences:
+        s_words = len(sentence.split())
+        if current_words + s_words > max_words and current:
+            chunks.append(' '.join(current))
+            current = [sentence]
+            current_words = s_words
+        else:
+            current.append(sentence)
+            current_words += s_words
+
+    if current:
+        chunks.append(' '.join(current))
+
+    # If any chunk is still too long, split by word count
+    final_chunks = []
+    for chunk in chunks:
+        words = chunk.split()
+        if len(words) > max_words:
+            for j in range(0, len(words), max_words):
+                sub = ' '.join(words[j:j + max_words])
+                if sub:
+                    final_chunks.append(sub)
+        else:
+            final_chunks.append(chunk)
+
+    return final_chunks if final_chunks else [text]
 
 def groq_transcribe(audio_path: str, api_key: str, model: str = 'whisper-large-v3') -> str:
     """Upload audio to Groq Whisper API and return SRT content."""
