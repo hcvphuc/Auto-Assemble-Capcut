@@ -1230,12 +1230,11 @@ def save_config(data: dict):
         json.dump(data, f, indent=2)
 
 
-def gemini_transcribe(audio_path: str, api_key: str,
-                      script_text: str = "",
-                      model: str = 'gemini-2.5-flash') -> str:
-    """Transcribe audio using Gemini 2.5 Flash via 2BRAIN API (itera102.cloud).
-    Sends audio as base64 data URL + optional script for proper noun accuracy.
-    Returns SRT content string.
+def _gemini_transcribe_chunk(audio_path: str, api_key: str,
+                              script_text: str = "",
+                              model: str = 'gemini-2.5-flash') -> str:
+    """Transcribe a single audio chunk using Gemini 2.5 Flash via 2BRAIN API.
+    Returns raw SRT content string. Audio must be <15MB.
     """
     import urllib.request
     import urllib.error
@@ -1311,7 +1310,6 @@ def gemini_transcribe(audio_path: str, api_key: str,
             # Clean markdown fences if Gemini wraps output
             if srt_text.startswith('```'):
                 lines = srt_text.split('\n')
-                # Remove first line (```srt or ```) and last line (```)
                 if lines[-1].strip() == '```':
                     lines = lines[1:-1]
                 else:
@@ -1323,6 +1321,144 @@ def gemini_transcribe(audio_path: str, api_key: str,
         raise RuntimeError(f"HTTP {e.code} {e.reason}: {body_text}")
     except Exception as e:
         raise RuntimeError(f"{type(e).__name__}: {e}")
+
+
+# ── Audio chunking for large files ─────────────────────────────────────────
+
+MAX_AUDIO_SIZE_MB = 15  # Max file size before chunking (base64 inflates ~33%)
+CHUNK_DURATION_SECS = 300  # 5 minutes per chunk
+
+def _get_audio_duration(audio_path: str) -> float:
+    """Get audio duration in seconds using ffprobe."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
+            capture_output=True, text=True, timeout=10
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+def _split_audio(audio_path: str, chunk_secs: int = CHUNK_DURATION_SECS) -> list:
+    """Split audio into chunks using ffmpeg. Returns list of (chunk_path, start_secs)."""
+    import subprocess
+    import tempfile
+
+    duration = _get_audio_duration(audio_path)
+    if duration <= 0:
+        return [(audio_path, 0.0)]
+
+    tmp_dir = tempfile.mkdtemp(prefix='auto_assemble_chunks_')
+    ext = os.path.splitext(audio_path)[1] or '.mp3'
+    chunks = []
+
+    start = 0.0
+    idx = 0
+    while start < duration:
+        chunk_path = os.path.join(tmp_dir, f"chunk_{idx:03d}{ext}")
+        try:
+            subprocess.run(
+                ['ffmpeg', '-y', '-i', audio_path, '-ss', str(start),
+                 '-t', str(chunk_secs), '-acodec', 'copy', chunk_path],
+                capture_output=True, timeout=60
+            )
+            if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
+                chunks.append((chunk_path, start))
+        except Exception:
+            pass
+        start += chunk_secs
+        idx += 1
+
+    return chunks if chunks else [(audio_path, 0.0)]
+
+
+def _offset_srt_timestamps(srt_text: str, offset_secs: float) -> str:
+    """Add offset_secs to all timestamps in an SRT string."""
+    def add_offset(match):
+        h, m, s, ms = int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
+        total_ms = h * 3600000 + m * 60000 + s * 1000 + ms + int(offset_secs * 1000)
+        if total_ms < 0:
+            total_ms = 0
+        nh = total_ms // 3600000; total_ms %= 3600000
+        nm = total_ms // 60000;   total_ms %= 60000
+        ns = total_ms // 1000;    nms = total_ms % 1000
+        return f"{nh:02d}:{nm:02d}:{ns:02d},{nms:03d}"
+
+    return re.sub(r'(\d{2}):(\d{2}):(\d{2}),(\d{3})', add_offset, srt_text)
+
+
+def _renumber_srt(srt_text: str) -> str:
+    """Re-number SRT entries sequentially starting from 1."""
+    blocks = re.split(r'\n\n+', srt_text.strip())
+    result = []
+    idx = 1
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) >= 2 and '-->' in lines[1]:
+            lines[0] = str(idx)
+            result.append('\n'.join(lines))
+            idx += 1
+        elif len(lines) >= 3 and '-->' in lines[1]:
+            lines[0] = str(idx)
+            result.append('\n'.join(lines))
+            idx += 1
+    return '\n\n'.join(result) + '\n'
+
+
+def gemini_transcribe(audio_path: str, api_key: str,
+                      script_text: str = "",
+                      model: str = 'gemini-2.5-flash',
+                      log_fn=None) -> str:
+    """Transcribe audio using Gemini 2.5 Flash. Auto-chunks large files via ffmpeg.
+    Returns SRT content string.
+    """
+    import shutil
+
+    file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+    _log = log_fn or (lambda msg: None)
+
+    if file_size_mb <= MAX_AUDIO_SIZE_MB:
+        # Small file — transcribe directly
+        _log(f"   📦 Audio size: {file_size_mb:.1f} MB (direct upload)")
+        return _gemini_transcribe_chunk(audio_path, api_key, script_text, model)
+
+    # Large file — split into chunks
+    _log(f"   📦 Audio size: {file_size_mb:.1f} MB > {MAX_AUDIO_SIZE_MB} MB limit")
+    _log(f"   ✂️ Splitting into {CHUNK_DURATION_SECS // 60}-min chunks via ffmpeg...")
+
+    chunks = _split_audio(audio_path, CHUNK_DURATION_SECS)
+    _log(f"   📂 {len(chunks)} chunks created")
+
+    all_srt_parts = []
+    tmp_dir = os.path.dirname(chunks[0][0]) if chunks else None
+
+    try:
+        for i, (chunk_path, offset_secs) in enumerate(chunks):
+            chunk_size = os.path.getsize(chunk_path) / (1024 * 1024)
+            _log(f"   🎙️ Transcribing chunk {i + 1}/{len(chunks)} "
+                 f"({chunk_size:.1f} MB, offset {offset_secs:.0f}s)...")
+
+            chunk_srt = _gemini_transcribe_chunk(chunk_path, api_key, script_text, model)
+
+            # Offset timestamps for non-first chunks
+            if offset_secs > 0:
+                chunk_srt = _offset_srt_timestamps(chunk_srt, offset_secs)
+
+            all_srt_parts.append(chunk_srt)
+
+        # Merge all chunks
+        merged = '\n\n'.join(all_srt_parts)
+        return _renumber_srt(merged)
+
+    finally:
+        # Cleanup temp chunks
+        if tmp_dir and tmp_dir != os.path.dirname(audio_path):
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 def align_srt_with_script(srt_content: str, script_text: str) -> str:
@@ -1624,7 +1760,8 @@ class AutoAssembleGUI(tk.Tk):
         import threading
         def do_transcribe():
             try:
-                srt_content = gemini_transcribe(audio_path, api_key, script_text=_script_text)
+                srt_content = gemini_transcribe(audio_path, api_key, script_text=_script_text,
+                                                 log_fn=lambda msg: self.after(0, lambda m=msg: self.log(m)))
                 # Post-process: align with script if available
                 if _script_text:
                     srt_content = align_srt_with_script(srt_content, _script_text)
