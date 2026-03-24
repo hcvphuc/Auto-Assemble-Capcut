@@ -1049,8 +1049,11 @@ AUDIO_EXTS = {'.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac'}
 IMAGE_EXTS  = {'.png', '.jpg', '.jpeg', '.webp'}
 
 def detect_inputs_from_folder(folder: str) -> dict:
-    """Scan a folder and return detected paths for srt, script, audio, images_dir."""
-    result = {"srt": "", "script": "", "audio": "", "images_dir": ""}
+    """Scan a folder and return detected paths for srt, script, script_raw, audio, images_dir.
+    .txt files → scene script (with [SCENE n] markers)
+    .md files → raw script (original narrative for spelling correction)
+    """
+    result = {"srt": "", "script": "", "script_raw": "", "audio": "", "images_dir": ""}
     if not os.path.isdir(folder):
         return result
 
@@ -1063,6 +1066,8 @@ def detect_inputs_from_folder(folder: str) -> dict:
             result["srt"] = full
         elif ext == ".txt" and not result["script"]:
             result["script"] = full
+        elif ext == ".md" and not result["script_raw"]:
+            result["script_raw"] = full
         elif ext in AUDIO_EXTS and not result["audio"]:
             result["audio"] = full
 
@@ -1078,7 +1083,7 @@ def detect_inputs_from_folder(folder: str) -> dict:
     if best_dir:
         result["images_dir"] = best_dir
 
-    # Also check sub-folders for SRT/script/audio if not found at root
+    # Also check sub-folders for SRT/script/audio/script_raw if not found at root
     for f in files:
         sub = os.path.join(folder, f)
         if not os.path.isdir(sub): continue
@@ -1089,6 +1094,8 @@ def detect_inputs_from_folder(folder: str) -> dict:
                 result["srt"] = full2
             elif ext == ".txt" and not result["script"]:
                 result["script"] = full2
+            elif ext == ".md" and not result["script_raw"]:
+                result["script_raw"] = full2
             elif ext in AUDIO_EXTS and not result["audio"]:
                 result["audio"] = full2
 
@@ -1745,8 +1752,8 @@ class AutoAssembleGUI(tk.Tk):
 
     def browse_script_raw(self):
         path = filedialog.askopenfilename(
-            title="Select raw script (.txt)",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+            title="Select raw script (.md / .txt)",
+            filetypes=[("Markdown", "*.md"), ("Text files", "*.txt"), ("All files", "*.*")])
         if path:
             self.var_script_raw.set(path)
             self.log(f"📄 Script (raw) selected: {os.path.basename(path)}")
@@ -1766,6 +1773,9 @@ class AutoAssembleGUI(tk.Tk):
         self.var_script.set(result["script"])
         self.var_images.set(result["images_dir"])
         self.var_audio.set(result["audio"])
+        # Auto-populate script_raw from .md file
+        if result.get("script_raw"):
+            self.var_script_raw.set(result["script_raw"])
         found = [k for k, v in result.items() if v]
         missing = [k for k, v in result.items() if not v]
         self.log(f"🔎 Scan complete → Found: {', '.join(found) or 'none'}"
