@@ -1342,7 +1342,10 @@ def _get_audio_duration(audio_path: str) -> float:
         return 0.0
 
 def _split_audio(audio_path: str, chunk_secs: int = CHUNK_DURATION_SECS) -> list:
-    """Split audio into chunks using ffmpeg. Returns list of (chunk_path, start_secs)."""
+    """Split audio into compressed chunks using ffmpeg.
+    Re-encodes to 32kbps mono MP3 to minimize file size for API upload.
+    Returns list of (chunk_path, start_secs).
+    """
     import subprocess
     import tempfile
 
@@ -1351,18 +1354,21 @@ def _split_audio(audio_path: str, chunk_secs: int = CHUNK_DURATION_SECS) -> list
         return [(audio_path, 0.0)]
 
     tmp_dir = tempfile.mkdtemp(prefix='auto_assemble_chunks_')
-    ext = os.path.splitext(audio_path)[1] or '.mp3'
     chunks = []
 
     start = 0.0
     idx = 0
     while start < duration:
-        chunk_path = os.path.join(tmp_dir, f"chunk_{idx:03d}{ext}")
+        chunk_path = os.path.join(tmp_dir, f"chunk_{idx:03d}.mp3")
         try:
             subprocess.run(
                 ['ffmpeg', '-y', '-i', audio_path, '-ss', str(start),
-                 '-t', str(chunk_secs), '-acodec', 'copy', chunk_path],
-                capture_output=True, timeout=60
+                 '-t', str(chunk_secs),
+                 '-ac', '1',           # mono
+                 '-ar', '16000',       # 16kHz sample rate (sufficient for speech)
+                 '-b:a', '32k',        # 32kbps bitrate
+                 chunk_path],
+                capture_output=True, timeout=120
             )
             if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
                 chunks.append((chunk_path, start))
