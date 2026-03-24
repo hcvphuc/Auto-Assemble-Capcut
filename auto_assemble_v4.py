@@ -8,11 +8,46 @@ import re
 import os
 import sys
 import json
+import platform
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional
+
+IS_MAC = platform.system() == 'Darwin'
+IS_WIN = platform.system() == 'Windows'
+
+
+def _get_capcut_drafts_root() -> str:
+    """Get CapCut drafts root folder for the current OS."""
+    if IS_MAC:
+        return os.path.expanduser('~/Movies/CapCut/User Data/Projects/com.lveditor.draft')
+    else:
+        local_app_data = os.environ.get('LOCALAPPDATA', '')
+        return os.path.join(local_app_data, 'CapCut', 'User Data', 'Projects', 'com.lveditor.draft')
+
+
+def _get_default_font() -> str:
+    """Get a default system font path for CapCut subtitle materials."""
+    if IS_MAC:
+        for p in ['/System/Library/Fonts/Helvetica.ttc',
+                  '/System/Library/Fonts/SFNSText.ttf',
+                  '/Library/Fonts/Arial.ttf']:
+            if os.path.exists(p):
+                return p
+        return '/System/Library/Fonts/Helvetica.ttc'
+    else:
+        return 'C:/WINDOWS/Fonts/seguibl.ttf'
+
+
+def _get_config_path() -> str:
+    """Get config file path for the current OS."""
+    if IS_MAC:
+        base = os.path.expanduser('~/Library/Application Support/AutoAssemble')
+    else:
+        base = os.path.join(os.environ.get('APPDATA', ''), 'AutoAssemble')
+    return os.path.join(base, 'config.json')
 
 
 # ── Data Models ──────────────────────────────────────────────────────────────
@@ -577,8 +612,7 @@ def create_capcut_project(
     import time as _time
     import shutil as _shutil
 
-    local_app_data = os.environ.get('LOCALAPPDATA', '')
-    drafts_root = os.path.join(local_app_data, 'CapCut', 'User Data', 'Projects', 'com.lveditor.draft')
+    drafts_root = _get_capcut_drafts_root()
     os.makedirs(drafts_root, exist_ok=True)
 
     # Create project folder with the given name
@@ -891,7 +925,7 @@ def make_text_material(mat_id: str, text: str) -> dict:
     content_json = json.dumps({
         "styles": [{
             "fill": {"content": {"render_type": "solid", "solid": {"color": [1.0, 1.0, 1.0]}},},
-            "font": {"path": "C:/WINDOWS/Fonts/seguibl.ttf", "id": ""},
+            "font": {"path": _get_default_font(), "id": ""},
             "size": 7.0,
             "range": [0, len(text)]
         }],
@@ -931,7 +965,7 @@ def make_text_material(mat_id: str, text: str) -> dict:
         "fixed_width": -1.0,
         "font_category_id": "", "font_category_name": "",
         "font_id": "", "font_name": "",
-        "font_path": "C:/WINDOWS/Fonts/seguibl.ttf",
+        "font_path": _get_default_font(),
         "font_resource_id": "", "font_size": 7.0,
         "font_source_platform": 0, "font_team_id": "",
         "font_third_resource_id": "", "font_title": "none",
@@ -1151,27 +1185,32 @@ def sync_capcut_meta(proj_path: str, duration_us: int, n_tracks: int = 1):
 def _find_capcut_exe() -> str:
     """Find CapCut executable path (from running process or known locations)."""
     import subprocess
-    possible = [
-        r"C:\Program Files\CapCut\CapCut.exe",
-        r"C:\Users\Administrator\AppData\Local\CapCut\Apps\CapCut.exe",
-    ]
-    # Try to find from running process first
-    try:
-        result = subprocess.run(
-            ["powershell", "-Command",
-             "(Get-Process capcut -ErrorAction SilentlyContinue | Select-Object -First 1).Path"],
-            capture_output=True, text=True, timeout=5
-        )
-        found = result.stdout.strip()
-        if found and os.path.exists(found):
-            return found
-    except Exception:
-        pass
-    # Fallback to known paths
-    for p in possible:
-        if os.path.exists(p):
-            return p
-    return ""
+    if IS_MAC:
+        possible = ['/Applications/CapCut.app']
+        for p in possible:
+            if os.path.exists(p):
+                return p
+        return ''
+    else:
+        possible = [
+            r"C:\Program Files\CapCut\CapCut.exe",
+            r"C:\Users\Administrator\AppData\Local\CapCut\Apps\CapCut.exe",
+        ]
+        try:
+            result = subprocess.run(
+                ["powershell", "-Command",
+                 "(Get-Process capcut -ErrorAction SilentlyContinue | Select-Object -First 1).Path"],
+                capture_output=True, text=True, timeout=5
+            )
+            found = result.stdout.strip()
+            if found and os.path.exists(found):
+                return found
+        except Exception:
+            pass
+        for p in possible:
+            if os.path.exists(p):
+                return p
+        return ''
 
 
 def kill_capcut() -> bool:
@@ -1180,26 +1219,31 @@ def kill_capcut() -> bool:
     import subprocess
     import time
 
-    # Check if running
-    try:
-        result = subprocess.run(
-            ["powershell", "-Command",
-             "(Get-Process capcut -ErrorAction SilentlyContinue).Count"],
-            capture_output=True, text=True, timeout=5
-        )
-        count = int(result.stdout.strip() or "0")
-        if count == 0:
-            return False  # Not running
-    except Exception:
-        pass
+    if IS_MAC:
+        try:
+            result = subprocess.run(['pgrep', '-f', 'CapCut'], capture_output=True, text=True, timeout=5)
+            if not result.stdout.strip():
+                return False
+            subprocess.run(['pkill', '-f', 'CapCut'], capture_output=True)
+        except Exception:
+            pass
+    else:
+        try:
+            result = subprocess.run(
+                ["powershell", "-Command",
+                 "(Get-Process capcut -ErrorAction SilentlyContinue).Count"],
+                capture_output=True, text=True, timeout=5
+            )
+            count = int(result.stdout.strip() or "0")
+            if count == 0:
+                return False
+        except Exception:
+            pass
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", "CapCut.exe"], capture_output=True)
+        except Exception:
+            pass
 
-    # Kill
-    try:
-        subprocess.run(["taskkill", "/F", "/IM", "CapCut.exe"], capture_output=True)
-    except Exception:
-        pass
-
-    # Wait for process to fully exit + all file handles released
     time.sleep(3)
     return True
 
@@ -1207,14 +1251,21 @@ def kill_capcut() -> bool:
 def launch_capcut() -> bool:
     """Launch CapCut."""
     import subprocess
-    exe = _find_capcut_exe()
-    if exe:
+    if IS_MAC:
         try:
-            subprocess.Popen([exe])
+            subprocess.Popen(['open', '-a', 'CapCut'])
             return True
         except Exception:
-            pass
-    return False
+            return False
+    else:
+        exe = _find_capcut_exe()
+        if exe:
+            try:
+                subprocess.Popen([exe])
+                return True
+            except Exception:
+                pass
+        return False
 
 
 
@@ -1222,7 +1273,7 @@ def launch_capcut() -> bool:
 # Step 1: Groq Whisper → fast ASR with precise timestamps (~15-30s)
 # Step 2: Gemini 2.5 Flash → text-only spelling correction using script (~10s)
 
-CONFIG_PATH = os.path.join(os.environ.get('APPDATA', ''), 'AutoAssemble', 'config.json')
+CONFIG_PATH = _get_config_path()
 
 def load_config() -> dict:
     import json
