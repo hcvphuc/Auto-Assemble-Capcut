@@ -1209,7 +1209,9 @@ def launch_capcut() -> bool:
 
 
 
-# ── Gemini 2.5 Flash Transcription via 2BRAIN API (itera102.cloud) ─────────
+# ── Hybrid Transcription: Whisper (Groq) + Gemini (2BRAIN) ────────────────
+# Step 1: Groq Whisper → fast ASR with precise timestamps (~15-30s)
+# Step 2: Gemini 2.5 Flash → text-only spelling correction using script (~10s)
 
 CONFIG_PATH = os.path.join(os.environ.get('APPDATA', ''), 'AutoAssemble', 'config.json')
 
@@ -1230,68 +1232,114 @@ def save_config(data: dict):
         json.dump(data, f, indent=2)
 
 
-def _gemini_transcribe_chunk(audio_path: str, api_key: str,
-                              script_text: str = "",
-                              model: str = 'gemini-2.5-flash') -> str:
-    """Transcribe a single audio chunk using Gemini 2.5 Flash via 2BRAIN API.
-    Returns raw SRT content string. Audio must be <15MB.
-    """
+# ── Step 1: Groq Whisper ASR ──────────────────────────────────────────────
+
+def _secs_to_srt_time(secs: float) -> str:
+    ms = int(round(secs * 1000))
+    h = ms // 3_600_000; ms %= 3_600_000
+    m = ms // 60_000;    ms %= 60_000
+    s = ms // 1_000;     ms %= 1_000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def segments_to_srt(segments: list) -> str:
+    lines = []
+    for i, seg in enumerate(segments, 1):
+        start = _secs_to_srt_time(seg['start'])
+        end   = _secs_to_srt_time(seg['end'])
+        text  = seg['text'].strip()
+        lines.append(f"{i}\n{start} --> {end}\n{text}\n")
+    return "\n".join(lines)
+
+def groq_transcribe(audio_path: str, api_key: str, model: str = 'whisper-large-v3') -> str:
+    """Upload audio to Groq Whisper API and return SRT content."""
     import urllib.request
     import urllib.error
     import mimetypes
-    import base64
+    import time as _time
 
-    # 1. Read & encode audio
+    url = 'https://api.groq.com/openai/v1/audio/transcriptions'
+    boundary = 'FormBoundary' + hex(int(_time.time()))[2:]
+
+    filename = os.path.basename(audio_path)
     mime = mimetypes.guess_type(audio_path)[0] or 'audio/mpeg'
-    with open(audio_path, 'rb') as f:
-        audio_b64 = base64.b64encode(f.read()).decode('ascii')
-    data_url = f"data:{mime};base64,{audio_b64}"
 
-    # 2. Build prompt
-    system_prompt = (
-        "You are a professional audio transcriber. "
-        "Your task is to transcribe audio into SRT subtitle format with precise timestamps. "
-        "Output ONLY valid SRT content — no markdown fences, no explanations, no extra text."
+    with open(audio_path, 'rb') as f:
+        audio_data = f.read()
+
+    CRLF = b'\r\n'
+    def field(name, value):
+        return (f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n').encode()
+
+    body = (
+        field('model', model) +
+        field('response_format', 'verbose_json') +
+        f'--{boundary}\r\n'.encode() +
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode() +
+        f'Content-Type: {mime}\r\n\r\n'.encode() +
+        audio_data + CRLF +
+        f'--{boundary}--\r\n'.encode()
     )
 
-    user_prompt = "Transcribe this audio into SRT format with precise timestamps.\n\n"
-    user_prompt += "Each SRT entry must follow this exact format:\n"
-    user_prompt += "{index}\n{HH:MM:SS,mmm} --> {HH:MM:SS,mmm}\n{text}\n\n"
-    user_prompt += "Rules:\n"
-    user_prompt += "- Keep each subtitle entry short (1-2 lines, max ~15 words)\n"
-    user_prompt += "- Timestamps must be precise and match the audio\n"
-    user_prompt += "- Use proper punctuation and capitalization\n"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': f'multipart/form-data; boundary={boundary}',
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': '*/*',
+        },
+        method='POST'
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            return segments_to_srt(data.get('segments', []))
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode('utf-8', errors='replace')[:500]
+        raise RuntimeError(f"Groq HTTP {e.code}: {body_text}")
+    except Exception as e:
+        raise RuntimeError(f"Groq: {type(e).__name__}: {e}")
 
-    if script_text:
-        user_prompt += (
-            "\nIMPORTANT: The voice-over was generated from the script below. "
-            "You MUST use the EXACT spelling from this script for all proper nouns, "
-            "names, numbers, and specific terms. Do NOT guess spellings — match the script exactly:\n"
-            "---SCRIPT START---\n"
-            f"{script_text}\n"
-            "---SCRIPT END---\n"
-        )
 
-    # 3. Build message content (multimodal: text + audio)
-    user_content = [
-        {"type": "text", "text": user_prompt},
-        {
-            "type": "image_url",
-            "image_url": {"url": data_url}
-        }
-    ]
+# ── Step 2: Gemini Text Correction (no audio — text only) ─────────────────
+
+def gemini_correct_srt(srt_content: str, script_text: str, api_key: str,
+                       model: str = 'gemini-2.5-flash') -> str:
+    """Use Gemini to correct SRT text spelling using the original script.
+    Text-only request (no audio) — very fast, no size limits.
+    """
+    import urllib.request
+    import urllib.error
+
+    prompt = (
+        "You are a subtitle editor. Below is an SRT file transcribed by Whisper, "
+        "and the original script that the voice-over was generated from.\n\n"
+        "Your task:\n"
+        "1. Compare each SRT entry's text with the script\n"
+        "2. Fix any misspelled proper nouns, names, numbers, or specific terms "
+        "to match the EXACT spelling from the script\n"
+        "3. Keep ALL timestamps EXACTLY as they are — do NOT change any timing\n"
+        "4. Keep the same number of SRT entries — do NOT add, remove, or merge entries\n"
+        "5. Only fix spelling errors — do NOT rewrite or rephrase sentences\n\n"
+        "Output ONLY the corrected SRT content. No markdown fences, no explanations.\n\n"
+        "---ORIGINAL SCRIPT---\n"
+        f"{script_text}\n"
+        "---END SCRIPT---\n\n"
+        "---SRT TO CORRECT---\n"
+        f"{srt_content}\n"
+        "---END SRT---"
+    )
 
     payload = json.dumps({
         "model": model,
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
+            {"role": "user", "content": prompt}
         ],
-        "temperature": 0.1,
+        "temperature": 0.0,
         "max_tokens": 65000
     })
 
-    # 4. POST to 2BRAIN API (itera102.cloud)
     url = 'https://api-v2.itera102.cloud/v1/chat/completions'
     req = urllib.request.Request(
         url,
@@ -1304,167 +1352,23 @@ def _gemini_transcribe_chunk(audio_path: str, api_key: str,
         method='POST'
     )
     try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             result = json.loads(resp.read().decode('utf-8'))
-            srt_text = result['choices'][0]['message']['content'].strip()
-            # Clean markdown fences if Gemini wraps output
-            if srt_text.startswith('```'):
-                lines = srt_text.split('\n')
+            corrected = result['choices'][0]['message']['content'].strip()
+            # Clean markdown fences
+            if corrected.startswith('```'):
+                lines = corrected.split('\n')
                 if lines[-1].strip() == '```':
                     lines = lines[1:-1]
                 else:
                     lines = lines[1:]
-                srt_text = '\n'.join(lines)
-            return srt_text
+                corrected = '\n'.join(lines)
+            return corrected
     except urllib.error.HTTPError as e:
         body_text = e.read().decode('utf-8', errors='replace')[:500]
-        raise RuntimeError(f"HTTP {e.code} {e.reason}: {body_text}")
+        raise RuntimeError(f"Gemini HTTP {e.code}: {body_text}")
     except Exception as e:
-        raise RuntimeError(f"{type(e).__name__}: {e}")
-
-
-# ── Audio chunking for large files ─────────────────────────────────────────
-
-MAX_AUDIO_SIZE_MB = 15  # Max file size before chunking (base64 inflates ~33%)
-CHUNK_DURATION_SECS = 300  # 5 minutes per chunk
-
-def _get_audio_duration(audio_path: str) -> float:
-    """Get audio duration in seconds using ffprobe."""
-    import subprocess
-    try:
-        result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-             '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
-            capture_output=True, text=True, timeout=10
-        )
-        return float(result.stdout.strip())
-    except Exception:
-        return 0.0
-
-def _split_audio(audio_path: str, chunk_secs: int = CHUNK_DURATION_SECS) -> list:
-    """Split audio into compressed chunks using ffmpeg.
-    Re-encodes to 32kbps mono MP3 to minimize file size for API upload.
-    Returns list of (chunk_path, start_secs).
-    """
-    import subprocess
-    import tempfile
-
-    duration = _get_audio_duration(audio_path)
-    if duration <= 0:
-        return [(audio_path, 0.0)]
-
-    tmp_dir = tempfile.mkdtemp(prefix='auto_assemble_chunks_')
-    chunks = []
-
-    start = 0.0
-    idx = 0
-    while start < duration:
-        chunk_path = os.path.join(tmp_dir, f"chunk_{idx:03d}.mp3")
-        try:
-            subprocess.run(
-                ['ffmpeg', '-y', '-i', audio_path, '-ss', str(start),
-                 '-t', str(chunk_secs),
-                 '-ac', '1',           # mono
-                 '-ar', '16000',       # 16kHz sample rate (sufficient for speech)
-                 '-b:a', '32k',        # 32kbps bitrate
-                 chunk_path],
-                capture_output=True, timeout=120
-            )
-            if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
-                chunks.append((chunk_path, start))
-        except Exception:
-            pass
-        start += chunk_secs
-        idx += 1
-
-    return chunks if chunks else [(audio_path, 0.0)]
-
-
-def _offset_srt_timestamps(srt_text: str, offset_secs: float) -> str:
-    """Add offset_secs to all timestamps in an SRT string."""
-    def add_offset(match):
-        h, m, s, ms = int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
-        total_ms = h * 3600000 + m * 60000 + s * 1000 + ms + int(offset_secs * 1000)
-        if total_ms < 0:
-            total_ms = 0
-        nh = total_ms // 3600000; total_ms %= 3600000
-        nm = total_ms // 60000;   total_ms %= 60000
-        ns = total_ms // 1000;    nms = total_ms % 1000
-        return f"{nh:02d}:{nm:02d}:{ns:02d},{nms:03d}"
-
-    return re.sub(r'(\d{2}):(\d{2}):(\d{2}),(\d{3})', add_offset, srt_text)
-
-
-def _renumber_srt(srt_text: str) -> str:
-    """Re-number SRT entries sequentially starting from 1."""
-    blocks = re.split(r'\n\n+', srt_text.strip())
-    result = []
-    idx = 1
-    for block in blocks:
-        lines = block.strip().split('\n')
-        if len(lines) >= 2 and '-->' in lines[1]:
-            lines[0] = str(idx)
-            result.append('\n'.join(lines))
-            idx += 1
-        elif len(lines) >= 3 and '-->' in lines[1]:
-            lines[0] = str(idx)
-            result.append('\n'.join(lines))
-            idx += 1
-    return '\n\n'.join(result) + '\n'
-
-
-def gemini_transcribe(audio_path: str, api_key: str,
-                      script_text: str = "",
-                      model: str = 'gemini-2.5-flash',
-                      log_fn=None) -> str:
-    """Transcribe audio using Gemini 2.5 Flash. Auto-chunks large files via ffmpeg.
-    Returns SRT content string.
-    """
-    import shutil
-
-    file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
-    _log = log_fn or (lambda msg: None)
-
-    if file_size_mb <= MAX_AUDIO_SIZE_MB:
-        # Small file — transcribe directly
-        _log(f"   📦 Audio size: {file_size_mb:.1f} MB (direct upload)")
-        return _gemini_transcribe_chunk(audio_path, api_key, script_text, model)
-
-    # Large file — split into chunks
-    _log(f"   📦 Audio size: {file_size_mb:.1f} MB > {MAX_AUDIO_SIZE_MB} MB limit")
-    _log(f"   ✂️ Splitting into {CHUNK_DURATION_SECS // 60}-min chunks via ffmpeg...")
-
-    chunks = _split_audio(audio_path, CHUNK_DURATION_SECS)
-    _log(f"   📂 {len(chunks)} chunks created")
-
-    all_srt_parts = []
-    tmp_dir = os.path.dirname(chunks[0][0]) if chunks else None
-
-    try:
-        for i, (chunk_path, offset_secs) in enumerate(chunks):
-            chunk_size = os.path.getsize(chunk_path) / (1024 * 1024)
-            _log(f"   🎙️ Transcribing chunk {i + 1}/{len(chunks)} "
-                 f"({chunk_size:.1f} MB, offset {offset_secs:.0f}s)...")
-
-            chunk_srt = _gemini_transcribe_chunk(chunk_path, api_key, script_text, model)
-
-            # Offset timestamps for non-first chunks
-            if offset_secs > 0:
-                chunk_srt = _offset_srt_timestamps(chunk_srt, offset_secs)
-
-            all_srt_parts.append(chunk_srt)
-
-        # Merge all chunks
-        merged = '\n\n'.join(all_srt_parts)
-        return _renumber_srt(merged)
-
-    finally:
-        # Cleanup temp chunks
-        if tmp_dir and tmp_dir != os.path.dirname(audio_path):
-            try:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            except Exception:
-                pass
+        raise RuntimeError(f"Gemini: {type(e).__name__}: {e}")
 
 
 def align_srt_with_script(srt_content: str, script_text: str) -> str:
@@ -1539,8 +1443,8 @@ def align_srt_with_script(srt_content: str, script_text: str) -> str:
 class AutoAssembleGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Auto Video Assembly v4 — Gemini 2.5 Flash & CapCut Creator")
-        self.geometry("760x720")
+        self.title("Auto Video Assembly v4 — Whisper + Gemini Hybrid")
+        self.geometry("760x760")
         self.configure(padx=20, pady=20)
         self.columnconfigure(1, weight=1)
 
@@ -1579,19 +1483,34 @@ class AutoAssembleGUI(tk.Tk):
         ttk.Button(lf_files, text="Browse", command=self.browse_script_raw).grid(
             row=5, column=2, pady=2)
 
-        # 2BRAIN API key row
-        ttk.Label(lf_files, text="2BRAIN API Key:", foreground="#555").grid(
-            row=6, column=0, sticky="w", pady=(4, 2))
+        # API Keys section
         cfg = load_config()
-        self.var_api_key = tk.StringVar(value=cfg.get('2brain_api_key', ''))
-        self.entry_api_key = ttk.Entry(lf_files, textvariable=self.var_api_key, show="*")
-        self.entry_api_key.grid(row=6, column=1, sticky="ew", padx=8, pady=(4, 2))
-        ttk.Button(lf_files, text="💾 Save", width=6,
-                   command=self.save_api_key).grid(row=6, column=2, pady=(4, 2))
+
+        # Groq API key (for Whisper ASR)
+        ttk.Label(lf_files, text="Groq API Key:", foreground="#555").grid(
+            row=6, column=0, sticky="w", pady=(4, 2))
+        self.var_groq_key = tk.StringVar(value=cfg.get('groq_api_key', ''))
+        ttk.Entry(lf_files, textvariable=self.var_groq_key, show="*").grid(
+            row=6, column=1, sticky="ew", padx=8, pady=(4, 2))
+        ttk.Button(lf_files, text="💾", width=3,
+                   command=lambda: self._save_key('groq_api_key', self.var_groq_key)).grid(
+                   row=6, column=2, sticky="w", pady=(4, 2))
+
+        # 2BRAIN API key (for Gemini correction) — optional
+        ttk.Label(lf_files, text="2BRAIN Key:", foreground="#555").grid(
+            row=7, column=0, sticky="w", pady=(2, 2))
+        self.var_2brain_key = tk.StringVar(value=cfg.get('2brain_api_key', ''))
+        ttk.Entry(lf_files, textvariable=self.var_2brain_key, show="*").grid(
+            row=7, column=1, sticky="ew", padx=8, pady=(2, 2))
+        ttk.Button(lf_files, text="💾", width=3,
+                   command=lambda: self._save_key('2brain_api_key', self.var_2brain_key)).grid(
+                   row=7, column=2, sticky="w", pady=(2, 2))
+        ttk.Label(lf_files, text="(optional — for Gemini spelling correction)",
+                  foreground="#999").grid(row=7, column=1, sticky="e", padx=8)
 
         # Re-scan button
         ttk.Button(lf_files, text="↺ Re-scan", command=self.do_scan).grid(
-            row=7, column=2, sticky="e", pady=(4, 0))
+            row=8, column=2, sticky="e", pady=(4, 0))
 
 
         # ── Section 2: Export Destination ────────────────────────────────────
@@ -1688,6 +1607,14 @@ class AutoAssembleGUI(tk.Tk):
         self.text_log.see(tk.END)
         self.update_idletasks()
 
+    def browse_script_raw(self):
+        path = filedialog.askopenfilename(
+            title="Select raw script (.txt)",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if path:
+            self.var_script_raw.set(path)
+            self.log(f"📄 Script (raw) selected: {os.path.basename(path)}")
+
     def browse_folder(self):
         path = filedialog.askdirectory(title="Select Project Folder")
         if path:
@@ -1708,42 +1635,35 @@ class AutoAssembleGUI(tk.Tk):
         self.log(f"🔎 Scan complete → Found: {', '.join(found) or 'none'}"
                  + (f"  |  Missing: {', '.join(missing)}" if missing else ""))
 
-    def browse_script_raw(self):
-        path = filedialog.askopenfilename(
-            title="Select raw script (.txt)",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
-        if path:
-            self.var_script_raw.set(path)
-            self.log(f"📄 Script (raw) selected: {os.path.basename(path)}")
-
-    def save_api_key(self):
-        key = self.var_api_key.get().strip()
+    def _save_key(self, config_key, var):
+        key = var.get().strip()
         if not key:
-            messagebox.showwarning("Empty", "Please enter your 2BRAIN API key first.")
+            messagebox.showwarning("Empty", f"Please enter the API key first.")
             return
         cfg = load_config()
-        cfg['2brain_api_key'] = key
+        cfg[config_key] = key
         save_config(cfg)
-        self.log("💾 2BRAIN API key saved.")
+        label = 'Groq' if 'groq' in config_key else '2BRAIN'
+        self.log(f"💾 {label} API key saved.")
 
     def transcribe_audio(self):
         audio_path = self.var_audio.get()
         if not audio_path or not os.path.exists(audio_path):
-            messagebox.showerror("Missing Audio", "Please select an audio file first (Browse folder or fill Audio field).")
+            messagebox.showerror("Missing Audio", "Please select an audio file first.")
             return
-        api_key = self.var_api_key.get().strip()
-        if not api_key:
-            messagebox.showerror("Missing Key", "Please enter your 2BRAIN API key and click Save.")
+        groq_key = self.var_groq_key.get().strip()
+        if not groq_key:
+            messagebox.showerror("Missing Key", "Please enter your Groq API key (for Whisper transcription).")
             return
 
-        # Check for optional script reference
+        # Check for optional script + 2BRAIN key for Gemini correction
         script_text = ""
+        brain_key = self.var_2brain_key.get().strip()
         script_raw_path = self.var_script_raw.get().strip()
         if script_raw_path and os.path.exists(script_raw_path):
             try:
                 with open(script_raw_path, 'r', encoding='utf-8') as f:
                     script_text = f.read()
-                self.log(f"📋 Script reference loaded: {len(script_text)} chars")
             except Exception:
                 pass
 
@@ -1757,23 +1677,39 @@ class AutoAssembleGUI(tk.Tk):
 
         self.btn_transcribe.config(state="disabled", text="⏳ Transcribing...")
         self.log(f"🎤 Transcribing: {os.path.basename(audio_path)}")
-        self.log(f"   Model: gemini-2.5-flash via 2BRAIN API")
-        if script_text:
-            self.log(f"   Script-guided mode: ON (proper nouns will match script)")
+        self.log(f"   Step 1: Whisper Large v3 (Groq) — fast ASR")
+        if script_text and brain_key:
+            self.log(f"   Step 2: Gemini 2.5 Flash (2BRAIN) — spelling correction")
+        elif script_text and not brain_key:
+            self.log(f"   Step 2: Local alignment (no 2BRAIN key — using difflib fallback)")
         self.update_idletasks()
 
-        _script_text = script_text  # capture for thread
+        _script_text = script_text
+        _brain_key = brain_key
         import threading
         def do_transcribe():
             try:
-                srt_content = gemini_transcribe(audio_path, api_key, script_text=_script_text,
-                                                 log_fn=lambda msg: self.after(0, lambda m=msg: self.log(m)))
-                # Post-process: align with script if available
+                # Step 1: Whisper ASR (fast, ~15-30s)
+                self.after(0, lambda: self.log("   ⏳ Step 1/2: Whisper transcribing..."))
+                srt_content = groq_transcribe(audio_path, groq_key)
+                n1 = len(re.findall(r'^\d+$', srt_content, re.MULTILINE))
+                self.after(0, lambda: self.log(f"   ✅ Step 1 done: {n1} entries from Whisper"))
+
+                # Step 2: Spelling correction (if script provided)
                 if _script_text:
-                    srt_content = align_srt_with_script(srt_content, _script_text)
+                    if _brain_key:
+                        # Use Gemini for intelligent correction
+                        self.after(0, lambda: self.log("   ⏳ Step 2/2: Gemini correcting spelling..."))
+                        srt_content = gemini_correct_srt(srt_content, _script_text, _brain_key)
+                        self.after(0, lambda: self.log("   ✅ Step 2 done: Gemini spelling correction applied"))
+                    else:
+                        # Fallback: local difflib alignment
+                        self.after(0, lambda: self.log("   ⏳ Step 2/2: Local alignment..."))
+                        srt_content = align_srt_with_script(srt_content, _script_text)
+                        self.after(0, lambda: self.log("   ✅ Step 2 done: Local alignment applied"))
+
                 with open(srt_out, 'w', encoding='utf-8') as f:
                     f.write(srt_content)
-                # Count entries
                 import re as _re
                 n = len(_re.findall(r'^\d+$', srt_content, _re.MULTILINE))
                 self.after(0, lambda: self._transcribe_done(srt_out, n))
@@ -1785,7 +1721,7 @@ class AutoAssembleGUI(tk.Tk):
     def _transcribe_done(self, srt_out, n_entries):
         self.btn_transcribe.config(state="normal", text="🎤 Transcribe→SRT")
         self.var_srt.set(srt_out)
-        self.log(f"✅ Transcription done! {n_entries} entries → {os.path.basename(srt_out)}")
+        self.log(f"✅ Transcription complete! {n_entries} entries → {os.path.basename(srt_out)}")
         self.log(f"   Saved: {srt_out}")
 
     def _transcribe_error(self, err):
