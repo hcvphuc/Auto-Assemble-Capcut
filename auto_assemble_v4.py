@@ -1428,11 +1428,24 @@ def _split_text_smart(text: str, max_words: int = 12) -> list:
     return final_chunks if final_chunks else [text]
 
 def groq_transcribe(audio_path: str, api_key: str, model: str = 'whisper-large-v3') -> str:
-    """Upload audio to Groq Whisper API and return SRT content."""
+    """Upload audio to Groq Whisper API and return SRT content.
+    Groq limit: 25MB max file size.
+    """
     import urllib.request
     import urllib.error
     import mimetypes
     import time as _time
+
+    # Check file size (Groq limit: 25MB)
+    file_size = os.path.getsize(audio_path)
+    file_size_mb = file_size / (1024 * 1024)
+
+    if file_size_mb > 25:
+        raise RuntimeError(
+            f"File quá lớn: {file_size_mb:.1f}MB (Groq max: 25MB).\n"
+            f"Hãy nén file audio trước khi transcribe.\n"
+            f"Gợi ý: dùng online tool như freeconvert.com để chuyển sang MP3 128kbps."
+        )
 
     url = 'https://api.groq.com/openai/v1/audio/transcriptions'
     boundary = 'FormBoundary' + hex(int(_time.time()))[2:]
@@ -1457,6 +1470,9 @@ def groq_transcribe(audio_path: str, api_key: str, model: str = 'whisper-large-v
         f'--{boundary}--\r\n'.encode()
     )
 
+    # Longer timeout for large files (10s per MB, minimum 120s)
+    upload_timeout = max(120, int(file_size_mb * 10) + 60)
+
     req = urllib.request.Request(
         url,
         data=body,
@@ -1469,12 +1485,17 @@ def groq_transcribe(audio_path: str, api_key: str, model: str = 'whisper-large-v
         method='POST'
     )
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=upload_timeout) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             return segments_to_srt(data.get('segments', []))
     except urllib.error.HTTPError as e:
         body_text = e.read().decode('utf-8', errors='replace')[:500]
         raise RuntimeError(f"Groq HTTP {e.code}: {body_text}")
+    except TimeoutError:
+        raise RuntimeError(
+            f"Upload timeout ({file_size_mb:.1f}MB). Kết nối mạng quá chậm.\n"
+            f"Thử lại hoặc nén file audio nhỏ hơn."
+        )
     except Exception as e:
         raise RuntimeError(f"Groq: {type(e).__name__}: {e}")
 
@@ -1873,8 +1894,11 @@ class AutoAssembleGUI(tk.Tk):
                 return
 
         self.btn_transcribe.config(state="disabled", text="⏳ Transcribing...")
-        self.log(f"🎤 Transcribing: {os.path.basename(audio_path)}")
+        file_mb = os.path.getsize(audio_path) / (1024 * 1024)
+        self.log(f"🎤 Transcribing: {os.path.basename(audio_path)} ({file_mb:.1f}MB)")
         self.log(f"   Step 1: Whisper Large v3 (Groq) — fast ASR")
+        if file_mb > 15:
+            self.log(f"   ⚠️ Large file — upload may take 1-2 minutes...")
         if script_text:
             self.log(f"   Step 2: Script alignment — fix proper nouns (<1s)")
         self.update_idletasks()
@@ -1884,7 +1908,7 @@ class AutoAssembleGUI(tk.Tk):
         def do_transcribe():
             try:
                 # Step 1: Whisper ASR (fast, ~15-30s)
-                self.after(0, lambda: self.log("   ⏳ Step 1: Whisper transcribing..."))
+                self.after(0, lambda: self.log("   ⏳ Step 1: Uploading & transcribing..."))
                 srt_content = groq_transcribe(audio_path, groq_key)
                 n1 = len(re.findall(r'^\d+$', srt_content, re.MULTILINE))
                 self.after(0, lambda: self.log(f"   ✅ Step 1 done: {n1} entries from Whisper"))
