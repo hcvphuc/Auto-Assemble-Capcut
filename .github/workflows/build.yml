@@ -10,19 +10,8 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - os: windows-latest
-            artifact_name: AutoAssemble_v4_Windows
-            exe_name: auto_assemble_v4.exe
-          - os: macos-latest
-            artifact_name: AutoAssemble_v4_macOS
-            exe_name: auto_assemble_v4
-
-    runs-on: ${{ matrix.os }}
-
+  build-windows:
+    runs-on: windows-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -36,17 +25,51 @@ jobs:
         run: pip install pyinstaller
 
       - name: Build executable
-        run: |
-          pyinstaller --onefile --windowed --name auto_assemble_v4 auto_assemble_v4.py
+        run: pyinstaller --onefile --windowed --name auto_assemble_v4 auto_assemble_v4.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/${{ matrix.exe_name }}
+          name: AutoAssemble_v4_Windows
+          path: dist/auto_assemble_v4.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pyinstaller
+
+      - name: Build .app bundle
+        run: pyinstaller --onedir --windowed --name AutoAssemble_v4 auto_assemble_v4.py
+
+      - name: Create DMG
+        run: |
+          # Create a temporary folder for DMG contents
+          mkdir -p dmg_contents
+          cp -R dist/AutoAssemble_v4.app dmg_contents/
+          
+          # Create DMG
+          hdiutil create -volname "AutoAssemble v4" \
+            -srcfolder dmg_contents \
+            -ov -format UDZO \
+            AutoAssemble_v4.dmg
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoAssemble_v4_macOS
+          path: AutoAssemble_v4.dmg
 
   release:
-    needs: build
+    needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
 
@@ -68,5 +91,5 @@ jobs:
         with:
           files: |
             release/windows/auto_assemble_v4.exe
-            release/macos/auto_assemble_v4
+            release/macos/AutoAssemble_v4.dmg
           generate_release_notes: true
