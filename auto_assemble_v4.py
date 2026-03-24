@@ -1678,35 +1678,25 @@ class AutoAssembleGUI(tk.Tk):
         self.btn_transcribe.config(state="disabled", text="⏳ Transcribing...")
         self.log(f"🎤 Transcribing: {os.path.basename(audio_path)}")
         self.log(f"   Step 1: Whisper Large v3 (Groq) — fast ASR")
-        if script_text and brain_key:
-            self.log(f"   Step 2: Gemini 2.5 Flash (2BRAIN) — spelling correction")
-        elif script_text and not brain_key:
-            self.log(f"   Step 2: Local alignment (no 2BRAIN key — using difflib fallback)")
+        if script_text:
+            self.log(f"   Step 2: Script alignment — fix proper nouns (<1s)")
         self.update_idletasks()
 
         _script_text = script_text
-        _brain_key = brain_key
         import threading
         def do_transcribe():
             try:
                 # Step 1: Whisper ASR (fast, ~15-30s)
-                self.after(0, lambda: self.log("   ⏳ Step 1/2: Whisper transcribing..."))
+                self.after(0, lambda: self.log("   ⏳ Step 1: Whisper transcribing..."))
                 srt_content = groq_transcribe(audio_path, groq_key)
                 n1 = len(re.findall(r'^\d+$', srt_content, re.MULTILINE))
                 self.after(0, lambda: self.log(f"   ✅ Step 1 done: {n1} entries from Whisper"))
 
-                # Step 2: Spelling correction (if script provided)
+                # Step 2: Local alignment (instant — uses difflib to match script spelling)
                 if _script_text:
-                    if _brain_key:
-                        # Use Gemini for intelligent correction
-                        self.after(0, lambda: self.log("   ⏳ Step 2/2: Gemini correcting spelling..."))
-                        srt_content = gemini_correct_srt(srt_content, _script_text, _brain_key)
-                        self.after(0, lambda: self.log("   ✅ Step 2 done: Gemini spelling correction applied"))
-                    else:
-                        # Fallback: local difflib alignment
-                        self.after(0, lambda: self.log("   ⏳ Step 2/2: Local alignment..."))
-                        srt_content = align_srt_with_script(srt_content, _script_text)
-                        self.after(0, lambda: self.log("   ✅ Step 2 done: Local alignment applied"))
+                    self.after(0, lambda: self.log("   ⏳ Step 2: Aligning with script..."))
+                    srt_content = align_srt_with_script(srt_content, _script_text)
+                    self.after(0, lambda: self.log("   ✅ Step 2 done: proper nouns corrected"))
 
                 with open(srt_out, 'w', encoding='utf-8') as f:
                     f.write(srt_content)
