@@ -231,12 +231,12 @@ def normalize(text: str) -> str:
     text = text.lower()
     text = re.sub(r"'s\b", '', text)       # drop possessives
     text = re.sub(r"[^\w\s]", ' ', text)   # strip punctuation
-    # Normalize numbers both ways (digit→word and word→digit)
+    # Normalize numbers: always convert to word form so both match
     tokens = text.split()
     result = []
     for t in tokens:
-        if t in _NUM2WORD:  t = _NUM2WORD[t]   # 6 → six
-        elif t in _WORD2NUM: t = _WORD2NUM[t]  # six → 6 (keep consistent)
+        if t in _NUM2WORD:   t = _NUM2WORD[t]   # "1" → "one"
+        elif t in _WORD2NUM: t = _NUM2WORD[_WORD2NUM[t]]  # "one" → "1" → "one" (stays word)
         if t not in _STOP_WORDS:               # remove stop words
             result.append(t)
     return ' '.join(result)
