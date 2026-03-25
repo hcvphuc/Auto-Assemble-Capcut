@@ -141,7 +141,66 @@ def parse_voiceover(path: str) -> list[Scene]:
             continue
         scenes.append(Scene(num=num, text=text))
 
+    # Auto-dedup overlapping text between consecutive scenes
+    scenes = dedup_scene_overlaps(scenes)
     return scenes
+
+
+def dedup_scene_overlaps(scenes: list, min_overlap_words: int = 8) -> list:
+    """Remove duplicated text between the tail of Scene N and head of Scene N+1.
+    If the last K words of scene N match the first K words of scene N+1 (K >= min_overlap_words),
+    trim those words from the end of scene N.
+    """
+    if len(scenes) < 2:
+        return scenes
+
+    cleaned = []
+    for idx in range(len(scenes)):
+        scene = scenes[idx]
+        if idx < len(scenes) - 1:
+            next_scene = scenes[idx + 1]
+            trimmed_text = _remove_tail_overlap(scene.text, next_scene.text, min_overlap_words)
+            cleaned.append(Scene(num=scene.num, text=trimmed_text))
+        else:
+            cleaned.append(scene)
+
+    return cleaned
+
+
+def _remove_tail_overlap(text_a: str, text_b: str, min_words: int = 8) -> str:
+    """If text_a ends with the same words that text_b starts with (>= min_words),
+    remove that overlap from text_a.
+    Uses normalized word comparison to handle minor punctuation differences.
+    """
+    words_a = text_a.split()
+    words_b = text_b.split()
+
+    if len(words_a) < min_words or len(words_b) < min_words:
+        return text_a
+
+    # Normalize for comparison (lowercase, strip punctuation)
+    def norm(w):
+        return re.sub(r'[^\w]', '', w.lower())
+
+    norm_a = [norm(w) for w in words_a]
+    norm_b = [norm(w) for w in words_b]
+
+    # Find the longest suffix of A that matches a prefix of B
+    best_overlap = 0
+    max_check = min(len(norm_a), len(norm_b))
+
+    for overlap_len in range(min_words, max_check + 1):
+        suffix_a = norm_a[-overlap_len:]
+        prefix_b = norm_b[:overlap_len]
+        if suffix_a == prefix_b:
+            best_overlap = overlap_len
+
+    if best_overlap >= min_words:
+        # Trim the overlapping tail from text_a
+        trimmed_words = words_a[:-best_overlap]
+        return ' '.join(trimmed_words) if trimmed_words else text_a
+
+    return text_a
 
 
 # ── Matching Logic ───────────────────────────────────────────────────────────
@@ -2157,8 +2216,24 @@ class AutoAssembleGUI(tk.Tk):
 
         # 2. Parse Voiceover
         try:
-            scenes = parse_voiceover(script_path)
+            # Parse raw scenes
+            with open(script_path, 'r', encoding='utf-8') as _sf:
+                raw_content = _sf.read()
+            raw_parts = re.split(r'\[SCENE\s+(\d+)\]\s*', raw_content)
+            raw_scenes = []
+            for _ri in range(1, len(raw_parts), 2):
+                _rnum = int(raw_parts[_ri])
+                _rtxt = raw_parts[_ri + 1].strip() if _ri + 1 < len(raw_parts) else ''
+                if _rtxt and _rtxt.lower() != 'undefined':
+                    raw_scenes.append(Scene(num=_rnum, text=_rtxt))
+
+            scenes = dedup_scene_overlaps(raw_scenes)
+
+            # Count how many scenes were trimmed
+            n_deduped = sum(1 for r, c in zip(raw_scenes, scenes) if len(r.text) != len(c.text))
             self.log(f"🎙️ Parsed Script: {len(scenes)} valid scenes found.")
+            if n_deduped > 0:
+                self.log(f"   🔧 Auto-dedup: removed overlapping text from {n_deduped} scene(s)")
         except Exception as e:
             self.log(f"❌ Error parsing script: {e}")
             return
