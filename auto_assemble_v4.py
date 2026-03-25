@@ -168,9 +168,10 @@ def dedup_scene_overlaps(scenes: list, min_overlap_words: int = 8) -> list:
 
 
 def _remove_tail_overlap(text_a: str, text_b: str, min_words: int = 8) -> str:
-    """If text_a ends with the same words that text_b starts with (>= min_words),
-    remove that overlap from text_a.
-    Uses normalized word comparison to handle minor punctuation differences.
+    """Find where the opening words of text_b appear inside text_a,
+    and trim text_a from that point onward.
+    Searches the entire text_a (not just suffix) so it catches overlap
+    embedded in the middle of a long scene.
     """
     words_a = text_a.split()
     words_b = text_b.split()
@@ -185,20 +186,20 @@ def _remove_tail_overlap(text_a: str, text_b: str, min_words: int = 8) -> str:
     norm_a = [norm(w) for w in words_a]
     norm_b = [norm(w) for w in words_b]
 
-    # Find the longest suffix of A that matches a prefix of B
-    best_overlap = 0
-    max_check = min(len(norm_a), len(norm_b))
+    # Take the first `probe_len` words of B as the search probe
+    probe_len = min(min_words, len(norm_b))
+    probe = norm_b[:probe_len]
 
-    for overlap_len in range(min_words, max_check + 1):
-        suffix_a = norm_a[-overlap_len:]
-        prefix_b = norm_b[:overlap_len]
-        if suffix_a == prefix_b:
-            best_overlap = overlap_len
+    # Search for `probe` anywhere in A (starting from the first quarter onward)
+    # We don't search the very beginning to avoid false positives
+    search_start = max(0, len(norm_a) // 4)
 
-    if best_overlap >= min_words:
-        # Trim the overlapping tail from text_a
-        trimmed_words = words_a[:-best_overlap]
-        return ' '.join(trimmed_words) if trimmed_words else text_a
+    for i in range(search_start, len(norm_a) - probe_len + 1):
+        if norm_a[i:i + probe_len] == probe:
+            # Found the overlap point — trim A here
+            trimmed = words_a[:i]
+            if trimmed:
+                return ' '.join(trimmed)
 
     return text_a
 
