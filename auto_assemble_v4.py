@@ -1427,34 +1427,140 @@ def _split_text_smart(text: str, max_words: int = 12) -> list:
 
     return final_chunks if final_chunks else [text]
 
-def groq_transcribe(audio_path: str, api_key: str, model: str = 'whisper-large-v3') -> str:
-    """Upload audio to Groq Whisper API and return SRT content.
-    Groq limit: 25MB max file size.
+CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5MB per chunk
+
+
+def _parse_mp3_frames(data: bytes) -> list:
+    """Parse MP3 frame boundaries from raw bytes.
+    Returns list of (offset, frame_size, duration_seconds) tuples.
     """
+    frames = []
+    pos = 0
+    length = len(data)
+
+    # Skip ID3v2 tag if present
+    if data[:3] == b'ID3' and length > 10:
+        id3_size = ((data[6] & 0x7F) << 21 | (data[7] & 0x7F) << 14 |
+                    (data[8] & 0x7F) << 7 | (data[9] & 0x7F))
+        pos = id3_size + 10
+
+    bitrate_table = {
+        # MPEG1 Layer3
+        (3, 1): [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0],
+        # MPEG2 Layer3
+        (2, 1): [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+    }
+    sample_rate_table = {
+        3: [44100, 48000, 32000],  # MPEG1
+        2: [22050, 24000, 16000],  # MPEG2
+        0: [11025, 12000, 8000],   # MPEG2.5
+    }
+
+    while pos < length - 4:
+        # Find sync: 0xFF 0xE0+
+        if data[pos] != 0xFF or (data[pos + 1] & 0xE0) != 0xE0:
+            pos += 1
+            continue
+
+        header = data[pos:pos + 4]
+        b1 = header[1]
+        b2 = header[2]
+
+        mpeg_version = (b1 >> 3) & 0x03  # 0=2.5, 2=2, 3=1
+        layer = (b1 >> 1) & 0x03  # 1=Layer3
+        bitrate_idx = (b2 >> 4) & 0x0F
+        sr_idx = (b2 >> 2) & 0x03
+        padding = (b2 >> 1) & 0x01
+
+        if layer != 1 or sr_idx >= 3 or bitrate_idx == 0 or bitrate_idx == 15:
+            pos += 1
+            continue
+
+        br_key = (mpeg_version, layer)
+        if br_key not in bitrate_table:
+            br_key = (2, 1)  # fallback to MPEG2
+
+        bitrate = bitrate_table[br_key][bitrate_idx] * 1000
+        if mpeg_version not in sample_rate_table or sr_idx >= len(sample_rate_table[mpeg_version]):
+            pos += 1
+            continue
+        sample_rate = sample_rate_table[mpeg_version][sr_idx]
+
+        if bitrate == 0 or sample_rate == 0:
+            pos += 1
+            continue
+
+        # Frame size calculation
+        if mpeg_version == 3:  # MPEG1
+            frame_size = (144 * bitrate // sample_rate) + padding
+            samples_per_frame = 1152
+        else:  # MPEG2/2.5
+            frame_size = (72 * bitrate // sample_rate) + padding
+            samples_per_frame = 576
+
+        if frame_size < 4 or pos + frame_size > length:
+            pos += 1
+            continue
+
+        duration = samples_per_frame / sample_rate
+        frames.append((pos, frame_size, duration))
+        pos += frame_size
+
+    return frames
+
+
+def _split_mp3_chunks(audio_path: str, chunk_bytes: int = CHUNK_SIZE_BYTES) -> list:
+    """Split an MP3 file into chunks at frame boundaries.
+    Returns list of (chunk_data: bytes, time_offset: float) tuples.
+    """
+    with open(audio_path, 'rb') as f:
+        data = f.read()
+
+    file_size = len(data)
+    if file_size <= chunk_bytes:
+        return [(data, 0.0)]
+
+    frames = _parse_mp3_frames(data)
+    if not frames:
+        # Fallback: can't parse frames, send whole file
+        return [(data, 0.0)]
+
+    chunks = []
+    chunk_start_frame = 0
+    chunk_start_offset = frames[0][0]  # byte offset
+    time_offset = 0.0
+    accumulated_bytes = 0
+    accumulated_time = 0.0
+
+    for i, (offset, fsize, fdur) in enumerate(frames):
+        accumulated_bytes += fsize
+        accumulated_time += fdur
+
+        # Check if we've accumulated enough bytes for a chunk
+        is_last = (i == len(frames) - 1)
+        if accumulated_bytes >= chunk_bytes or is_last:
+            chunk_end = offset + fsize
+            chunk_data = data[chunk_start_offset:chunk_end]
+            chunks.append((chunk_data, time_offset))
+
+            time_offset += accumulated_time
+            accumulated_bytes = 0
+            accumulated_time = 0.0
+            if not is_last:
+                chunk_start_offset = frames[i + 1][0]
+
+    return chunks
+
+
+def _groq_transcribe_chunk(audio_data: bytes, api_key: str, filename: str,
+                           model: str = 'whisper-large-v3') -> list:
+    """Transcribe a single audio chunk via Groq API. Returns segment list."""
     import urllib.request
     import urllib.error
-    import mimetypes
     import time as _time
-
-    # Check file size (Groq limit: 25MB)
-    file_size = os.path.getsize(audio_path)
-    file_size_mb = file_size / (1024 * 1024)
-
-    if file_size_mb > 25:
-        raise RuntimeError(
-            f"File quá lớn: {file_size_mb:.1f}MB (Groq max: 25MB).\n"
-            f"Hãy nén file audio trước khi transcribe.\n"
-            f"Gợi ý: dùng online tool như freeconvert.com để chuyển sang MP3 128kbps."
-        )
 
     url = 'https://api.groq.com/openai/v1/audio/transcriptions'
     boundary = 'FormBoundary' + hex(int(_time.time()))[2:]
-
-    filename = os.path.basename(audio_path)
-    mime = mimetypes.guess_type(audio_path)[0] or 'audio/mpeg'
-
-    with open(audio_path, 'rb') as f:
-        audio_data = f.read()
 
     CRLF = b'\r\n'
     def field(name, value):
@@ -1465,17 +1571,16 @@ def groq_transcribe(audio_path: str, api_key: str, model: str = 'whisper-large-v
         field('response_format', 'verbose_json') +
         f'--{boundary}\r\n'.encode() +
         f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode() +
-        f'Content-Type: {mime}\r\n\r\n'.encode() +
+        f'Content-Type: audio/mpeg\r\n\r\n'.encode() +
         audio_data + CRLF +
         f'--{boundary}--\r\n'.encode()
     )
 
-    # Longer timeout for large files (10s per MB, minimum 120s)
-    upload_timeout = max(120, int(file_size_mb * 10) + 60)
+    chunk_mb = len(audio_data) / (1024 * 1024)
+    upload_timeout = max(120, int(chunk_mb * 15) + 60)
 
     req = urllib.request.Request(
-        url,
-        data=body,
+        url, data=body,
         headers={
             'Authorization': f'Bearer {api_key}',
             'Content-Type': f'multipart/form-data; boundary={boundary}',
@@ -1484,20 +1589,73 @@ def groq_transcribe(audio_path: str, api_key: str, model: str = 'whisper-large-v
         },
         method='POST'
     )
-    try:
-        with urllib.request.urlopen(req, timeout=upload_timeout) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            return segments_to_srt(data.get('segments', []))
-    except urllib.error.HTTPError as e:
-        body_text = e.read().decode('utf-8', errors='replace')[:500]
-        raise RuntimeError(f"Groq HTTP {e.code}: {body_text}")
-    except TimeoutError:
-        raise RuntimeError(
-            f"Upload timeout ({file_size_mb:.1f}MB). Kết nối mạng quá chậm.\n"
-            f"Thử lại hoặc nén file audio nhỏ hơn."
-        )
-    except Exception as e:
-        raise RuntimeError(f"Groq: {type(e).__name__}: {e}")
+
+    with urllib.request.urlopen(req, timeout=upload_timeout) as resp:
+        data = json.loads(resp.read().decode('utf-8'))
+        return data.get('segments', [])
+
+
+def groq_transcribe(audio_path: str, api_key: str, model: str = 'whisper-large-v3',
+                    log_fn=None) -> str:
+    """Upload audio to Groq Whisper API and return SRT content.
+    For files >5MB, automatically splits MP3 at frame boundaries,
+    transcribes each chunk, adjusts timestamps, and merges results.
+    Pure Python — no ffmpeg needed.
+    """
+    import urllib.error
+
+    file_size = os.path.getsize(audio_path)
+    file_size_mb = file_size / (1024 * 1024)
+    filename = os.path.basename(audio_path)
+
+    # Small file: send directly
+    if file_size_mb <= 20:
+        try:
+            with open(audio_path, 'rb') as f:
+                audio_data = f.read()
+            segments = _groq_transcribe_chunk(audio_data, api_key, filename, model)
+            return segments_to_srt(segments)
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode('utf-8', errors='replace')[:500]
+            raise RuntimeError(f"Groq HTTP {e.code}: {body_text}")
+        except Exception as e:
+            raise RuntimeError(f"Groq: {type(e).__name__}: {e}")
+
+    # Large file: split into chunks
+    if log_fn:
+        log_fn(f"   📦 Large file ({file_size_mb:.1f}MB) — splitting into chunks...")
+
+    chunks = _split_mp3_chunks(audio_path)
+    n_chunks = len(chunks)
+
+    if log_fn:
+        log_fn(f"   📦 Split into {n_chunks} chunks (~5MB each)")
+
+    all_segments = []
+    for i, (chunk_data, time_offset) in enumerate(chunks):
+        chunk_mb = len(chunk_data) / (1024 * 1024)
+        if log_fn:
+            log_fn(f"   ⏳ Chunk {i+1}/{n_chunks} ({chunk_mb:.1f}MB) uploading...")
+
+        try:
+            segments = _groq_transcribe_chunk(chunk_data, api_key,
+                                              f"chunk_{i+1}.mp3", model)
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode('utf-8', errors='replace')[:500]
+            raise RuntimeError(f"Groq HTTP {e.code} on chunk {i+1}: {body_text}")
+        except Exception as e:
+            raise RuntimeError(f"Groq chunk {i+1}: {type(e).__name__}: {e}")
+
+        # Offset timestamps for this chunk
+        for seg in segments:
+            seg['start'] += time_offset
+            seg['end'] += time_offset
+            all_segments.append(seg)
+
+        if log_fn:
+            log_fn(f"   ✅ Chunk {i+1}/{n_chunks} done ({len(segments)} segments)")
+
+    return segments_to_srt(all_segments)
 
 
 # ── Step 2: Gemini Text Correction (no audio — text only) ─────────────────
@@ -1909,7 +2067,8 @@ class AutoAssembleGUI(tk.Tk):
             try:
                 # Step 1: Whisper ASR (fast, ~15-30s)
                 self.after(0, lambda: self.log("   ⏳ Step 1: Uploading & transcribing..."))
-                srt_content = groq_transcribe(audio_path, groq_key)
+                srt_content = groq_transcribe(audio_path, groq_key,
+                                               log_fn=lambda msg: self.after(0, lambda m=msg: self.log(m)))
                 n1 = len(re.findall(r'^\d+$', srt_content, re.MULTILINE))
                 self.after(0, lambda: self.log(f"   ✅ Step 1 done: {n1} entries from Whisper"))
 
