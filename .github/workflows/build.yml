@@ -59,6 +59,8 @@ jobs:
           # Verify architecture
           echo "=== Verifying Intel binary ==="
           file dist/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
+          # Ad-hoc sign
+          codesign --force --deep --sign - dist/AutoAssemble_v4.app
 
       - name: Upload Intel app
         uses: actions/upload-artifact@v4
@@ -89,6 +91,8 @@ jobs:
           # Verify architecture
           echo "=== Verifying ARM binary ==="
           file dist/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
+          # Ad-hoc sign
+          codesign --force --deep --sign - dist/AutoAssemble_v4.app
 
       - name: Upload ARM app
         uses: actions/upload-artifact@v4
@@ -159,8 +163,30 @@ jobs:
           echo ""
           lipo -info universal-app/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
 
-      - name: Make executable
-        run: chmod +x universal-app/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
+      - name: Fix permissions and code sign
+        run: |
+          # Fix execute permissions on ALL Mach-O binaries
+          # (upload-artifact strips Unix permissions)
+          echo "=== Fixing permissions ==="
+          find universal-app/AutoAssemble_v4.app -type f | while read f; do
+            if file "$f" | grep -q "Mach-O"; then
+              chmod +x "$f"
+              echo "  chmod +x: $(basename $f)"
+            fi
+          done
+
+          # Ad-hoc code sign the entire app bundle
+          # REQUIRED for Apple Silicon (M1/M2/M3) — unsigned apps won't run
+          echo ""
+          echo "=== Code signing (ad-hoc) ==="
+          codesign --force --deep --sign - universal-app/AutoAssemble_v4.app
+          echo "Code signing complete."
+
+          # Verify signature
+          echo ""
+          echo "=== Verifying signature ==="
+          codesign --verify --verbose universal-app/AutoAssemble_v4.app
+          echo "Signature valid."
 
       - name: Create DMG
         run: |
