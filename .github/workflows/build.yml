@@ -10,6 +10,9 @@ permissions:
   contents: write
 
 jobs:
+  # ────────────────────────────────────────────────────────
+  # Windows build (unchanged)
+  # ────────────────────────────────────────────────────────
   build-windows:
     runs-on: windows-latest
     steps:
@@ -33,8 +36,11 @@ jobs:
           name: AutoAssemble_v4_Windows
           path: dist/auto_assemble_v4.exe
 
-  build-macos:
-    runs-on: macos-latest
+  # ────────────────────────────────────────────────────────
+  # macOS Intel (x86_64) build
+  # ────────────────────────────────────────────────────────
+  build-macos-intel:
+    runs-on: macos-13
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -47,29 +53,147 @@ jobs:
       - name: Install dependencies
         run: pip install pyinstaller
 
-      - name: Build .app bundle
-        run: pyinstaller --onedir --windowed --name AutoAssemble_v4 auto_assemble_v4.py
+      - name: Build binary (Intel x86_64)
+        run: |
+          pyinstaller --onedir --windowed --name AutoAssemble_v4 auto_assemble_v4.py
+          # Verify architecture
+          echo "=== Verifying Intel binary ==="
+          file dist/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
+
+      - name: Upload Intel app
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-intel-app
+          path: dist/AutoAssemble_v4.app
+
+  # ────────────────────────────────────────────────────────
+  # macOS ARM (Apple Silicon) build
+  # ────────────────────────────────────────────────────────
+  build-macos-arm:
+    runs-on: macos-14
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pyinstaller
+
+      - name: Build binary (ARM arm64)
+        run: |
+          pyinstaller --onedir --windowed --name AutoAssemble_v4 auto_assemble_v4.py
+          # Verify architecture
+          echo "=== Verifying ARM binary ==="
+          file dist/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
+
+      - name: Upload ARM app
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm-app
+          path: dist/AutoAssemble_v4.app
+
+  # ────────────────────────────────────────────────────────
+  # Merge Intel + ARM → Universal binary → DMG
+  # ────────────────────────────────────────────────────────
+  create-universal-dmg:
+    needs: [build-macos-intel, build-macos-arm]
+    runs-on: macos-14
+    steps:
+      - name: Download Intel app
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-intel-app
+          path: intel-app/AutoAssemble_v4.app
+
+      - name: Download ARM app
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-arm-app
+          path: arm-app/AutoAssemble_v4.app
+
+      - name: Create universal binary with lipo
+        run: |
+          # Use ARM app as the base (copy entire .app bundle)
+          cp -R arm-app/AutoAssemble_v4.app universal-app/AutoAssemble_v4.app
+
+          # Find and merge ALL Mach-O binaries (main exe + bundled .so/.dylib files)
+          echo "=== Merging Mach-O binaries ==="
+          
+          find arm-app/AutoAssemble_v4.app -type f | while read arm_file; do
+            # Get relative path
+            rel_path="${arm_file#arm-app/AutoAssemble_v4.app/}"
+            intel_file="intel-app/AutoAssemble_v4.app/${rel_path}"
+            universal_file="universal-app/AutoAssemble_v4.app/${rel_path}"
+            
+            # Check if file exists in Intel build
+            if [ ! -f "$intel_file" ]; then
+              continue
+            fi
+            
+            # Check if it's a Mach-O binary
+            if file "$arm_file" | grep -q "Mach-O"; then
+              echo "  Merging: $rel_path"
+              lipo -create "$intel_file" "$arm_file" -output "$universal_file" 2>/dev/null || true
+            fi
+          done
+
+          # Verify main executable
+          echo ""
+          echo "=== Verifying universal binary ==="
+          file universal-app/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
+          echo ""
+          lipo -info universal-app/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
+
+      - name: Make executable
+        run: chmod +x universal-app/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
 
       - name: Create DMG
         run: |
-          # Create a temporary folder for DMG contents
-          mkdir -p dmg_contents
-          cp -R dist/AutoAssemble_v4.app dmg_contents/
-          
-          # Create DMG
-          hdiutil create -volname "AutoAssemble v4" \
-            -srcfolder dmg_contents \
-            -ov -format UDZO \
-            AutoAssemble_v4.dmg
+          # Install create-dmg for a professional-looking DMG
+          brew install create-dmg
 
-      - name: Upload DMG
+          # Create DMG with drag-to-Applications layout
+          create-dmg \
+            --volname "AutoAssemble v4" \
+            --volicon "universal-app/AutoAssemble_v4.app/Contents/Resources/AutoAssemble_v4.icns" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "AutoAssemble_v4.app" 150 190 \
+            --app-drop-link 450 190 \
+            --no-internet-enable \
+            "AutoAssemble_v4_Universal.dmg" \
+            "universal-app/" \
+          || {
+            # Fallback: create-dmg may fail if no .icns icon exists, retry without icon
+            echo "Retrying without custom icon..."
+            create-dmg \
+              --volname "AutoAssemble v4" \
+              --window-pos 200 120 \
+              --window-size 600 400 \
+              --icon-size 100 \
+              --icon "AutoAssemble_v4.app" 150 190 \
+              --app-drop-link 450 190 \
+              --no-internet-enable \
+              "AutoAssemble_v4_Universal.dmg" \
+              "universal-app/"
+          }
+
+      - name: Upload Universal DMG
         uses: actions/upload-artifact@v4
         with:
-          name: AutoAssemble_v4_macOS
-          path: AutoAssemble_v4.dmg
+          name: AutoAssemble_v4_macOS_Universal
+          path: AutoAssemble_v4_Universal.dmg
 
+  # ────────────────────────────────────────────────────────
+  # Create GitHub Release with all assets
+  # ────────────────────────────────────────────────────────
   release:
-    needs: [build-windows, build-macos]
+    needs: [build-windows, create-universal-dmg]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
 
@@ -80,10 +204,10 @@ jobs:
           name: AutoAssemble_v4_Windows
           path: release/windows
 
-      - name: Download macOS artifact
+      - name: Download macOS Universal DMG
         uses: actions/download-artifact@v4
         with:
-          name: AutoAssemble_v4_macOS
+          name: AutoAssemble_v4_macOS_Universal
           path: release/macos
 
       - name: Create Release
@@ -91,5 +215,5 @@ jobs:
         with:
           files: |
             release/windows/auto_assemble_v4.exe
-            release/macos/AutoAssemble_v4.dmg
+            release/macos/AutoAssemble_v4_Universal.dmg
           generate_release_notes: true
