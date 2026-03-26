@@ -117,7 +117,16 @@ jobs:
 
       - name: Create universal binary with lipo
         run: |
+          # Debug: show what was downloaded
+          echo "=== Intel app structure ==="
+          find intel-app -maxdepth 4 -type f | head -20
+          echo ""
+          echo "=== ARM app structure ==="
+          find arm-app -maxdepth 4 -type f | head -20
+          echo ""
+
           # Use ARM app as the base (copy entire .app bundle)
+          mkdir -p universal-app
           cp -R arm-app/AutoAssemble_v4.app universal-app/AutoAssemble_v4.app
 
           # Find and merge ALL Mach-O binaries (main exe + bundled .so/.dylib files)
@@ -137,7 +146,9 @@ jobs:
             # Check if it's a Mach-O binary
             if file "$arm_file" | grep -q "Mach-O"; then
               echo "  Merging: $rel_path"
-              lipo -create "$intel_file" "$arm_file" -output "$universal_file" 2>/dev/null || true
+              lipo -create "$intel_file" "$arm_file" -output "$universal_file" 2>/dev/null || {
+                echo "    WARNING: lipo failed for $rel_path, keeping ARM version"
+              }
             fi
           done
 
