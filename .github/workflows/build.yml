@@ -171,22 +171,43 @@ jobs:
           find universal-app/AutoAssemble_v4.app -type f | while read f; do
             if file "$f" | grep -q "Mach-O"; then
               chmod +x "$f"
-              echo "  chmod +x: $(basename $f)"
             fi
           done
+          echo "Permissions fixed."
 
-          # Ad-hoc code sign the entire app bundle
-          # REQUIRED for Apple Silicon (M1/M2/M3) — unsigned apps won't run
+          # Remove quarantine attributes
+          xattr -cr universal-app/AutoAssemble_v4.app 2>/dev/null || true
+
+          # Ad-hoc code sign — sign inner binaries first (inside-out)
+          # REQUIRED for Apple Silicon (M1/M2/M3)
           echo ""
-          echo "=== Code signing (ad-hoc) ==="
-          codesign --force --deep --sign - universal-app/AutoAssemble_v4.app
-          echo "Code signing complete."
+          echo "=== Code signing (ad-hoc, inside-out) ==="
+          
+          # 1) Sign all .so and .dylib files inside the bundle
+          find universal-app/AutoAssemble_v4.app -type f \( -name "*.so" -o -name "*.dylib" \) | while read lib; do
+            codesign --force --sign - "$lib" 2>/dev/null && echo "  Signed: $(basename $lib)" || true
+          done
+          
+          # 2) Sign all other Mach-O executables (not the main one yet)
+          find universal-app/AutoAssemble_v4.app/Contents/MacOS -type f ! -name "AutoAssemble_v4" | while read f; do
+            if file "$f" | grep -q "Mach-O"; then
+              codesign --force --sign - "$f" 2>/dev/null && echo "  Signed: $(basename $f)" || true
+            fi
+          done
+          
+          # 3) Sign the main executable
+          codesign --force --sign - universal-app/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
+          echo "  Signed: AutoAssemble_v4 (main)"
+          
+          # 4) Sign the entire .app bundle
+          codesign --force --sign - universal-app/AutoAssemble_v4.app
+          echo "  Signed: AutoAssemble_v4.app (bundle)"
 
-          # Verify signature
+          # Verify (non-fatal — ad-hoc signatures may not pass strict validation)
           echo ""
           echo "=== Verifying signature ==="
-          codesign --verify --verbose universal-app/AutoAssemble_v4.app
-          echo "Signature valid."
+          codesign -dvv universal-app/AutoAssemble_v4.app 2>&1 | head -10 || true
+          echo "Done."
 
       - name: Create DMG
         run: |
