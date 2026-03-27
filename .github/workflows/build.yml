@@ -53,20 +53,20 @@ jobs:
       - name: Install dependencies
         run: pip install pyinstaller
 
-      - name: Build binary (Intel x86_64)
+      - name: Build and sign (Intel x86_64)
         run: |
           pyinstaller --onedir --windowed --name AutoAssemble_v4 auto_assemble_v4.py
-          # Verify architecture
-          echo "=== Verifying Intel binary ==="
+          echo "=== Architecture ==="
           file dist/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
-          # Ad-hoc sign
           codesign --force --deep --sign - dist/AutoAssemble_v4.app
+          # TAR to preserve permissions & symlinks (upload-artifact zip breaks .app)
+          cd dist && tar czf ../intel-app.tar.gz AutoAssemble_v4.app
 
-      - name: Upload Intel app
+      - name: Upload Intel app (tar)
         uses: actions/upload-artifact@v4
         with:
-          name: macos-intel-app
-          path: dist/AutoAssemble_v4.app
+          name: macos-intel-tar
+          path: intel-app.tar.gz
 
   # ────────────────────────────────────────────────────────
   # macOS ARM (Apple Silicon) build
@@ -85,20 +85,20 @@ jobs:
       - name: Install dependencies
         run: pip install pyinstaller
 
-      - name: Build binary (ARM arm64)
+      - name: Build and sign (ARM arm64)
         run: |
           pyinstaller --onedir --windowed --name AutoAssemble_v4 auto_assemble_v4.py
-          # Verify architecture
-          echo "=== Verifying ARM binary ==="
+          echo "=== Architecture ==="
           file dist/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
-          # Ad-hoc sign
           codesign --force --deep --sign - dist/AutoAssemble_v4.app
+          # TAR to preserve permissions & symlinks
+          cd dist && tar czf ../arm-app.tar.gz AutoAssemble_v4.app
 
-      - name: Upload ARM app
+      - name: Upload ARM app (tar)
         uses: actions/upload-artifact@v4
         with:
-          name: macos-arm-app
-          path: dist/AutoAssemble_v4.app
+          name: macos-arm-tar
+          path: arm-app.tar.gz
 
   # ────────────────────────────────────────────────────────
   # Merge Intel + ARM → Universal binary → DMG
@@ -107,139 +107,68 @@ jobs:
     needs: [build-macos-intel, build-macos-arm]
     runs-on: macos-14
     steps:
-      - name: Download Intel app
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: macos-intel-app
-          path: intel-app/AutoAssemble_v4.app
+          path: artifacts
 
-      - name: Download ARM app
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-arm-app
-          path: arm-app/AutoAssemble_v4.app
+      - name: Extract apps from tar (preserves permissions)
+        run: |
+          mkdir -p intel-app arm-app
+          tar xzf artifacts/macos-intel-tar/intel-app.tar.gz -C intel-app
+          tar xzf artifacts/macos-arm-tar/arm-app.tar.gz -C arm-app
+          echo "=== Intel ==="
+          file intel-app/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
+          echo "=== ARM ==="
+          file arm-app/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
 
       - name: Create universal binary with lipo
         run: |
-          # Debug: show what was downloaded
-          echo "=== Intel app structure ==="
-          find intel-app -maxdepth 4 -type f | head -20
-          echo ""
-          echo "=== ARM app structure ==="
-          find arm-app -maxdepth 4 -type f | head -20
-          echo ""
+          # Use ARM app as the base (cp -R preserves permissions from tar)
+          cp -R arm-app/AutoAssemble_v4.app universal-app.app
 
-          # Use ARM app as the base (copy entire .app bundle)
-          mkdir -p universal-app
-          cp -R arm-app/AutoAssemble_v4.app universal-app/AutoAssemble_v4.app
-
-          # Find and merge ALL Mach-O binaries (main exe + bundled .so/.dylib files)
+          # Merge ALL Mach-O binaries
           echo "=== Merging Mach-O binaries ==="
-          
           find arm-app/AutoAssemble_v4.app -type f | while read arm_file; do
-            # Get relative path
             rel_path="${arm_file#arm-app/AutoAssemble_v4.app/}"
             intel_file="intel-app/AutoAssemble_v4.app/${rel_path}"
-            universal_file="universal-app/AutoAssemble_v4.app/${rel_path}"
+            universal_file="universal-app.app/${rel_path}"
             
-            # Check if file exists in Intel build
-            if [ ! -f "$intel_file" ]; then
-              continue
-            fi
+            [ ! -f "$intel_file" ] && continue
             
-            # Check if it's a Mach-O binary
             if file "$arm_file" | grep -q "Mach-O"; then
-              echo "  Merging: $rel_path"
-              lipo -create "$intel_file" "$arm_file" -output "$universal_file" 2>/dev/null || {
-                echo "    WARNING: lipo failed for $rel_path, keeping ARM version"
-              }
+              lipo -create "$intel_file" "$arm_file" -output "$universal_file" 2>/dev/null \
+                && echo "  Merged: $rel_path" || true
             fi
           done
 
-          # Verify main executable
           echo ""
-          echo "=== Verifying universal binary ==="
-          file universal-app/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
-          echo ""
-          lipo -info universal-app/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
+          echo "=== Universal binary verification ==="
+          file universal-app.app/Contents/MacOS/AutoAssemble_v4
+          lipo -info universal-app.app/Contents/MacOS/AutoAssemble_v4
 
-      - name: Fix permissions and code sign
+      - name: Code sign universal app
         run: |
-          # Fix execute permissions on ALL Mach-O binaries
-          # (upload-artifact strips Unix permissions)
-          echo "=== Fixing permissions ==="
-          find universal-app/AutoAssemble_v4.app -type f | while read f; do
-            if file "$f" | grep -q "Mach-O"; then
-              chmod +x "$f"
-            fi
-          done
-          echo "Permissions fixed."
-
-          # Remove quarantine attributes
-          xattr -cr universal-app/AutoAssemble_v4.app 2>/dev/null || true
-
-          # Ad-hoc code sign — sign inner binaries first (inside-out)
-          # REQUIRED for Apple Silicon (M1/M2/M3)
-          echo ""
-          echo "=== Code signing (ad-hoc, inside-out) ==="
-          
-          # 1) Sign all .so and .dylib files inside the bundle
-          find universal-app/AutoAssemble_v4.app -type f \( -name "*.so" -o -name "*.dylib" \) | while read lib; do
-            codesign --force --sign - "$lib" 2>/dev/null && echo "  Signed: $(basename $lib)" || true
-          done
-          
-          # 2) Sign all other Mach-O executables (not the main one yet)
-          find universal-app/AutoAssemble_v4.app/Contents/MacOS -type f ! -name "AutoAssemble_v4" | while read f; do
-            if file "$f" | grep -q "Mach-O"; then
-              codesign --force --sign - "$f" 2>/dev/null && echo "  Signed: $(basename $f)" || true
-            fi
-          done
-          
-          # 3) Sign the main executable
-          codesign --force --sign - universal-app/AutoAssemble_v4.app/Contents/MacOS/AutoAssemble_v4
-          echo "  Signed: AutoAssemble_v4 (main)"
-          
-          # 4) Sign the entire .app bundle
-          codesign --force --sign - universal-app/AutoAssemble_v4.app
-          echo "  Signed: AutoAssemble_v4.app (bundle)"
-
-          # Verify (non-fatal — ad-hoc signatures may not pass strict validation)
-          echo ""
-          echo "=== Verifying signature ==="
-          codesign -dvv universal-app/AutoAssemble_v4.app 2>&1 | head -10 || true
-          echo "Done."
+          # Clear quarantine and old signatures
+          xattr -cr universal-app.app 2>/dev/null || true
+          # Ad-hoc sign (required for Apple Silicon)
+          codesign --force --deep --sign - universal-app.app
+          echo "=== Signature info ==="
+          codesign -dvv universal-app.app 2>&1 | head -5 || true
 
       - name: Create DMG
         run: |
-          # Install create-dmg for a professional-looking DMG
-          brew install create-dmg
+          mkdir -p dmg_contents
+          cp -R universal-app.app dmg_contents/AutoAssemble_v4.app
+          ln -s /Applications dmg_contents/Applications
 
-          # Create DMG with drag-to-Applications layout
-          create-dmg \
-            --volname "AutoAssemble v4" \
-            --volicon "universal-app/AutoAssemble_v4.app/Contents/Resources/AutoAssemble_v4.icns" \
-            --window-pos 200 120 \
-            --window-size 600 400 \
-            --icon-size 100 \
-            --icon "AutoAssemble_v4.app" 150 190 \
-            --app-drop-link 450 190 \
-            --no-internet-enable \
-            "AutoAssemble_v4_Universal.dmg" \
-            "universal-app/" \
-          || {
-            # Fallback: create-dmg may fail if no .icns icon exists, retry without icon
-            echo "Retrying without custom icon..."
-            create-dmg \
-              --volname "AutoAssemble v4" \
-              --window-pos 200 120 \
-              --window-size 600 400 \
-              --icon-size 100 \
-              --icon "AutoAssemble_v4.app" 150 190 \
-              --app-drop-link 450 190 \
-              --no-internet-enable \
-              "AutoAssemble_v4_Universal.dmg" \
-              "universal-app/"
-          }
+          hdiutil create -volname "AutoAssemble v4" \
+            -srcfolder dmg_contents \
+            -ov -format UDZO \
+            AutoAssemble_v4_Universal.dmg
+          
+          echo "=== DMG created ==="
+          ls -lh AutoAssemble_v4_Universal.dmg
 
       - name: Upload Universal DMG
         uses: actions/upload-artifact@v4
